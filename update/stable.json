@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "version": "1.4.1",
-  "release_notes_url": "https://github.com/keyesvn/292VpvRelease/releases/tag/292vpn-v1.4.1",
+  "version": "1.4.2",
+  "release_notes_url": "https://github.com/keyesvn/292VpvRelease/releases/tag/292vpn-v1.4.2",
   "installer": {
     "urls": [
-      "https://github.com/keyesvn/292VpvRelease/releases/download/292vpn-v1.4.1/292VPN-1.4.1-windows-amd64-setup.exe"
+      "https://github.com/keyesvn/292VpvRelease/releases/download/292vpn-v1.4.2/292VPN-1.4.2-windows-amd64-setup.exe"
     ],
-    "sha256": "86f489bc81c76c849f8f74054af1b05d284ee4511fa3867f4c42d005dc287163",
-    "size": 20344000,
+    "sha256": "6baba883442054cd5858f7d92233b1a3ff94dbb34daaea4c7a85dba829d07fae",
+    "size": 20346504,
     "signer_thumbprint": "9C82EE2CA3B31AD41A57C584D391610CF0F369DF"
   }
 }
