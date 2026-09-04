@@ -6,8 +6,8 @@
     "urls": [
       "https://github.com/keyesvn/292VpvRelease/releases/download/292vpn-v1.4.4/292VPN-1.4.4-windows-amd64-setup.exe"
     ],
-    "sha256": "20ef79760b129c6745f67b42af4c6c93e8064da1f8bf0678725f3621d50bb009",
-    "size": 20334848,
+    "sha256": "a77dd9230414bee74d5c9c3ff9ca2db1f9d7e9c72e0f0d11f1774dc89f611c83",
+    "size": 20350232,
     "signer_thumbprint": "9C82EE2CA3B31AD41A57C584D391610CF0F369DF"
   }
 }
