@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "version": "1.5.2",
-  "release_notes_url": "https://github.com/keyesvn/292VpvRelease/releases/tag/292vpn-v1.5.2",
+  "version": "1.5.3",
+  "release_notes_url": "https://github.com/keyesvn/292VpvRelease/releases/tag/292vpn-v1.5.3",
   "installer": {
     "urls": [
-      "https://github.com/keyesvn/292VpvRelease/releases/download/292vpn-v1.5.2/292VPN-1.5.2-windows-amd64-setup.exe"
+      "https://github.com/keyesvn/292VpvRelease/releases/download/292vpn-v1.5.3/292VPN-1.5.3-windows-amd64-setup.exe"
     ],
-    "sha256": "e2ad2f61a62dde0ceb76d136dbe73f3524a9fb08c1a6d16d9c9fd56e60be948c",
-    "size": 28217392,
+    "sha256": "1ce0b2a1708a80aa1d21568e8dac253fc0649e9f159c3ee3cefcaa8c42da114f",
+    "size": 28217848,
     "signer_thumbprint": "9C82EE2CA3B31AD41A57C584D391610CF0F369DF"
   }
 }
