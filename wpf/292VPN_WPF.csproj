@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <RootNamespace>_292VPN_WPF</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>10.0</LangVersion>
+    <!-- Keep a three-part version so update comparisons remain deterministic. -->
+    <Version>1.5.7</Version>
+    <AssemblyTitle>292VPN</AssemblyTitle>
+    <Product>292VPN</Product>
+    <Company>292VPN Team</Company>
+    <Description>292VPN with Hysteria2 Support</Description>
+    <ApplicationIcon>assets\icon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>292VPN</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Security" />
+    <Reference Include="System.Management" />
+    <Reference Include="System.ServiceProcess" />
+    <!-- System.Net.Http ships with .NET Framework 4.8; referencing the 4.3.x
+         package instead pulls in a parallel implementation and assembly
+         binding redirects. Use the framework assembly. -->
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+    <PackageReference Include="System.Net.Http.Json" Version="8.0.0" />
+    <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
+    <PackageReference Include="Costura.Fody" Version="5.7.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Fonts\Inter-Regular.otf" />
+    <Resource Include="Fonts\Inter-Medium.otf" />
+    <Resource Include="Fonts\Inter-SemiBold.otf" />
+    <Resource Include="Fonts\Inter-Bold.otf" />
+    <Resource Include="Fonts\LICENSE.txt" />
+    <Content Include="..\dist\sing-box.exe" Link="sing-box.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\dist\sing-box.exe')" />
+    <Content Include="..\dist\wintun.dll" Link="wintun.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\dist\wintun.dll')" />
+    <Content Include="..\dist\libcronet.dll" Link="libcronet.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\dist\libcronet.dll')" />
+    <Content Include="..\third_party_manifest.json" Link="third_party_manifest.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\third_party_manifest.json')" />
+    <Content Include="update_sources.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

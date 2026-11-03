@@ -1,0 +1,30 @@
+services:
+  account-server:
+    container_name: zpm-account-server
+    image: zpm-account-server-account-server:latest
+    build: .
+    restart: unless-stopped
+    entrypoint: ["node"]
+    command: ["src/server.js"]
+    env_file:
+      - path: server.env
+        format: raw
+    environment:
+      PROTON_ENFORCE_ALLOWLIST: "1"
+      PROTON_SESSION_GRACE_MS: "1800000"
+    volumes:
+      - account-data:/data
+      - ./src:/app/src:ro
+      - ./secrets/wireguard-provisioner:/run/secrets/wireguard-provisioner:ro
+      - ./secrets/wireguard-known-hosts:/run/secrets/wireguard-known-hosts:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  account-data:
+    name: zpm-account-data
+    external: true
