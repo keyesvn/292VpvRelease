@@ -61,13 +61,24 @@ public class ApiService
     private const string VoiceProbeProcessName = "292VPN-VoiceProbe.exe";
 
     // These launchers assign a separate Vietnam HTTP/SOCKS proxy to each Zalo
-    // profile. Sending either the launcher or its child through 292VPN nests
-    // that proxy inside VLESS and can make the account proxy reject the session.
+    // profile, and the proxy is the account's exit IP. Only the call path may
+    // leave through the VPN; the launcher and the chat app keep using that
+    // proxy directly, otherwise chat and webview would show the VPN's IP.
     private static readonly string[] ManagedZaloProcessFamily =
     {
         "ZaX.exe",
         "ZManager.exe",
         "Zalo.exe"
+    };
+
+    // Zalo PC ships call media in a capture plugin that runs next to the chat
+    // app. An HTTP proxy cannot carry its UDP media, and UAE-style networks
+    // block direct VoIP, so this process (and its TCP signaling) takes the VPN.
+    private static readonly string[] ZaloCallProcessFamily =
+    {
+        "ZaloCall.exe",
+        "ZaloCap.exe",
+        "ZaviMeet.exe"
     };
 
     // Windows can identify UDP sockets by process name without resolving the
@@ -85,18 +96,6 @@ public class ApiService
         "Bria.exe",
         "PhonerLite.exe",
         "Jitsi.exe"
-    };
-
-    // Electron's NetworkService can lose process attribution after the traffic
-    // enters the TUN. Keep Zalo's webview traffic on the proxy as a fallback.
-    private static readonly string[] ZaloDomainSuffixes =
-    {
-        "zalo.me",
-        "zaloapp.com",
-        "zadn.vn",
-        // Zalo Business traffic observed in sing-box logs also uses these domains.
-        "zapps.vn",
-        "zbox.vn"
     };
 
     // Microsoft Store WhatsApp runs as WhatsApp.Root.exe from a versioned
@@ -206,6 +205,7 @@ public class ApiService
     private static long _currentUploadTotal;
     private static Process? _singBoxProcess;
     private static Task? _connectionTask;
+    private static Task<GenericResponse?>? _disconnectTask;
 
     private static CancellationTokenSource? _connectionCts;
     private static int _connectionGeneration;
@@ -581,6 +581,8 @@ public class ApiService
 
     public async Task<StatusResponse?> GetStatusAsync()
     {
+        int statusGeneration;
+        lock (_connectionLock) { statusGeneration = _connectionGeneration; }
         var config = LoadConfig();
         var activeProxy = config.SavedProxies.FirstOrDefault(p => p.Id == config.ActiveProxyId);
         if (IsWireGuardProxy(activeProxy) && config.ProxyMode == "all")
@@ -636,22 +638,7 @@ public class ApiService
             {
                 _wireGuardStatusFailures = 0;
             }
-            lock (_connectionLock)
-            {
-                if (running && _connectedState != "connecting")
-                {
-                    _connectedState = "connected";
-                    _connectionStartTime ??= DateTime.Now;
-                }
-                else if (!running && _connectedState == "connected")
-                {
-                    _connectedState = "disconnected";
-                    _connectionStartTime = null;
-                    _currentPublicIp = "--";
-                    _currentLatency = 0;
-                    Volatile.Write(ref _lastError, "WireGuard tunnel đã dừng.");
-                }
-            }
+            ApplyWireGuardStatus(statusGeneration, running);
 
             int wireGuardDuration = _connectionStartTime.HasValue && _connectedState == "connected"
                 ? (int)(DateTime.Now - _connectionStartTime.Value).TotalSeconds
@@ -685,12 +672,10 @@ public class ApiService
         lock (_connectionLock) { watchdogActive = _connectionTask != null && !_connectionTask.IsCompleted; }
         if (_connectedState == "connected" && !IsProcessRunning(process) && !watchdogActive)
         {
-            bool ownedCurrentProcess = false;
             lock (_connectionLock)
             {
-                if (ReferenceEquals(process, _singBoxProcess))
+                if (statusGeneration == _connectionGeneration && _connectedState == "connected" && ReferenceEquals(process, _singBoxProcess))
                 {
-                    ownedCurrentProcess = true;
                     _singBoxProcess = null;
                     _connectedState = "disconnected";
                     _connectionStartTime = null;
@@ -698,12 +683,9 @@ public class ApiService
                     _currentLatency = 0;
                     _currentDownloadTotal = 0;
                     _currentUploadTotal = 0;
+                    SetSystemProxy(false);
+                    StopOwnedProcess(process);
                 }
-            }
-            if (ownedCurrentProcess)
-            {
-                SetSystemProxy(false);
-                StopOwnedProcess(process);
             }
         }
 
@@ -807,13 +789,7 @@ public class ApiService
                         dest = $"{conn.Metadata.DestinationIP}:{conn.Metadata.DestinationPort}";
                     }
 
-                    string route = "Direct";
-                    // Match the outbound tag exactly; a substring test would also
-                    // match unrelated tags that merely contain "proxy".
-                    if (conn.Chains != null && conn.Chains.Any(c => string.Equals(c, "proxy-out", StringComparison.OrdinalIgnoreCase)))
-                    {
-                        route = "Proxy";
-                    }
+                    string route = ClassifyTrafficRoute(conn.Chains);
 
                     response.ActiveConnections.Add(new ConnectionInfo
                     {
@@ -836,74 +812,76 @@ public class ApiService
         return response;
     }
 
-    public async Task<GenericResponse?> ConnectAsync()
+    internal static string ClassifyTrafficRoute(IEnumerable<string>? chains) =>
+        chains != null && chains.Any(c => string.Equals(c, "proxy-out", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(c, "voip-out", StringComparison.OrdinalIgnoreCase)) ? "Proxy" : "Direct";
+
+    internal static void ApplyWireGuardStatus(int generation, bool running)
+    {
+        lock (_connectionLock)
+        {
+            // Polls are observations, never owners of a new connection. Only the
+            // handshake/recovery task may promote a connecting/disconnected state.
+            if (generation != _connectionGeneration || _disconnectTask != null || _connectedState != "connected") return;
+            if (!running)
+            {
+                _connectedState = "disconnected";
+                _connectionStartTime = null;
+                _currentPublicIp = "--";
+                _currentLatency = 0;
+                Volatile.Write(ref _lastError, "WireGuard tunnel đã dừng.");
+            }
+        }
+    }
+
+    public Task<GenericResponse?> ConnectAsync()
     {
         var config = LoadConfig();
         var activeProxy = config.SavedProxies.FirstOrDefault(p => p.Id == config.ActiveProxyId);
-
         if (activeProxy == null)
+            return Task.FromResult<GenericResponse?>(new GenericResponse { Success = false, Message = "Chưa chọn proxy hoạt động nào!" });
+        if (IsWireGuardProxy(activeProxy) && config.ProxyMode == "selected_only" && config.AllowedProcesses.Count == 0)
+            return Task.FromResult<GenericResponse?>(new GenericResponse { Success = false, Message = "Hãy thêm ít nhất một ứng dụng trước khi dùng chế độ chỉ định tuyến ứng dụng đã chọn." });
+        return Task.FromResult<GenericResponse?>(QueueConnection(async (generation, token) =>
         {
-            return new GenericResponse { Success = false, Message = "Chưa chọn proxy hoạt động nào!" };
-        }
-
-        if (IsWireGuardProxy(activeProxy) && config.ProxyMode == "all")
-        {
-            int nativeGeneration;
-            lock (_connectionLock)
+            try
             {
-                if (_connectedState == "connected") return new GenericResponse { Success = true, Message = "Đã kết nối rồi." };
-                if (_connectedState == "connecting" || _connectedState == "reconnecting")
-                    return new GenericResponse { Success = true, Message = "Đang kết nối." };
-                nativeGeneration = ++_connectionGeneration;
-                _connectedState = "connecting";
-                _currentPublicIp = "--";
-                _currentLatency = 0;
-                _currentDownloadTotal = 0;
-                _currentUploadTotal = 0;
-                Volatile.Write(ref _lastError, string.Empty);
-            }
-
-            // The native handshake waits on the service and the adapter, so run it
-            // in the background and let the status poll report the outcome.
-            _connectionTask = Task.Run(() => RunWireGuardConnectionAsync(nativeGeneration));
-            return new GenericResponse { Success = true, Message = "Bắt đầu kết nối..." };
-        }
-
-        if (IsWireGuardProxy(activeProxy))
-        {
-            if (config.ProxyMode == "selected_only" && config.AllowedProcesses.Count == 0)
-            {
-                return new GenericResponse
+                token.ThrowIfCancellationRequested();
+                if (IsWireGuardProxy(activeProxy) && config.ProxyMode == "all")
                 {
-                    Success = false,
-                    Message = "Hãy thêm ít nhất một ứng dụng trước khi dùng chế độ chỉ định tuyến ứng dụng đã chọn."
-                };
-            }
-            GenericResponse nativeStop;
-            await _nativeLifecycle.WaitAsync();
-            try { nativeStop = await StopWireGuardAsync(); }
-            finally { _nativeLifecycle.Release(); }
-            if (!nativeStop.Success)
-            {
-                return new GenericResponse
+                    await RunWireGuardConnectionAsync(generation);
+                    return;
+                }
+                if (IsWireGuardProxy(activeProxy))
                 {
-                    Success = false,
-                    Message = "Không thể chuyển WireGuard sang định tuyến theo ứng dụng: " + nativeStop.Message
-                };
+                    await _nativeLifecycle.WaitAsync(token);
+                    try
+                    {
+                        token.ThrowIfCancellationRequested();
+                        GenericResponse stop = await StopWireGuardAsync();
+                        if (!stop.Success) throw new InvalidOperationException(stop.Message);
+                    }
+                    finally { _nativeLifecycle.Release(); }
+                }
+                token.ThrowIfCancellationRequested();
+                VerifyThirdPartyFiles();
+                await RunConnectionAsync(activeProxy, config, generation, token);
             }
-        }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { SetFailureState(generation, ex.Message); }
+        }));
+    }
 
-        try
-        {
-            VerifyThirdPartyFiles();
-        }
-        catch (Exception ex)
-        {
-            return new GenericResponse { Success = false, Message = ex.Message };
-        }
-
+    internal static GenericResponse QueueConnection(Func<int, CancellationToken, Task> run)
+    {
         lock (_connectionLock)
         {
+            if (_connectedState == "error")
+                return new GenericResponse { Success = false, Message = "Dọn dẹp kết nối thất bại; hãy thử ngắt kết nối lại. " + Volatile.Read(ref _lastError) };
+            if (_disconnectTask != null)
+            {
+                return new GenericResponse { Success = false, Message = "Đang ngắt kết nối, vui lòng thử lại sau." };
+            }
             if (_connectedState == "connected")
             {
                 return new GenericResponse { Success = true, Message = "Đã kết nối rồi." };
@@ -912,6 +890,8 @@ public class ApiService
             {
                 return new GenericResponse { Success = true, Message = "Đang kết nối." };
             }
+            if (_connectionTask != null && !_connectionTask.IsCompleted)
+                return new GenericResponse { Success = false, Message = "Đang hoàn tất lần kết nối trước, vui lòng thử lại sau." };
 
             _connectedState = "connecting";
             _currentPublicIp = "--";
@@ -921,10 +901,12 @@ public class ApiService
             _reconnectAttempt = 0;
             _reconnectDelay = 0;
             Volatile.Write(ref _lastError, string.Empty);
+            _connectionCts?.Dispose();
             _connectionCts = new CancellationTokenSource();
             int generation = ++_connectionGeneration;
             CancellationToken token = _connectionCts.Token;
-            _connectionTask = Task.Run(() => RunConnectionAsync(activeProxy, config, generation, token));
+            // Publication and ownership are one transaction, for native and TUN.
+            _connectionTask = Task.Run(() => run(generation, token));
         }
 
         // Return as soon as the attempt is queued so the caller can paint the
@@ -938,6 +920,7 @@ public class ApiService
         await _nativeLifecycle.WaitAsync();
         try
         {
+            lock (_connectionLock) { if (nativeGeneration != _connectionGeneration) return; }
             GenericResponse result = await StartWireGuardAsync();
             AppConfig config = LoadConfig();
             Proxy? activeProxy = config.SavedProxies.FirstOrDefault(p => p.Id == config.ActiveProxyId);
@@ -1074,10 +1057,10 @@ public class ApiService
             StopOwnedProcess(launchedProcess);
             SetSystemProxy(false);
             string reason = $"sing-box đã dừng (mã {exitCode}).";
-            Volatile.Write(ref _lastError, reason);
             lock (_connectionLock)
             {
                 if (generation != _connectionGeneration) return;
+                Volatile.Write(ref _lastError, reason);
                 _connectedState = "reconnecting";
                 _connectionStartTime = null;
                 _currentPublicIp = "--";
@@ -1099,13 +1082,13 @@ public class ApiService
 
     private static void SetFailureState(int generation, string message)
     {
-        Volatile.Write(ref _lastError, message);
         bool owns;
         lock (_connectionLock)
         {
             owns = generation == _connectionGeneration;
             if (owns)
             {
+                Volatile.Write(ref _lastError, message);
                 _connectedState = "disconnected";
                 _connectionStartTime = null;
                 _currentPublicIp = "--";
@@ -1163,7 +1146,6 @@ public class ApiService
             Volatile.Write(ref _clashApiSecret, GenerateSecret());
             string tunInterfaceName = $"292vpn-{new Random().Next(1000, 9999)}";
             string configJson = GenerateSingBoxConfig(activeProxy, config, tunInterfaceName);
-            WriteRuntimeSingBoxConfig(configJson);
 
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
             string singboxExe = Path.Combine(baseDir, "sing-box.exe");
@@ -1182,7 +1164,13 @@ public class ApiService
                 RedirectStandardError = true
             };
 
-            launchedProcess = Process.Start(startInfo);
+            lock (_connectionLock)
+            {
+                if (generation != _connectionGeneration) throw new OperationCanceledException();
+                WriteRuntimeSingBoxConfig(configJson);
+                launchedProcess = Process.Start(startInfo);
+                _singBoxProcess = launchedProcess;
+            }
             if (launchedProcess == null) throw new InvalidOperationException("Không thể khởi động sing-box.");
             var startupErrors = new StringBuilder();
             launchedProcess.ErrorDataReceived += (_, e) =>
@@ -1228,13 +1216,10 @@ public class ApiService
             // mode the TUN already carries everything, so the system proxy is
             // only needed for proxy mode with every app routed.
             bool useSystemProxy = !config.UseVpnMode && config.ProxyMode == "all";
-            if (useSystemProxy)
-            {
-                SetSystemProxy(true, "127.0.0.1", config.LocalPort);
-            }
             lock (_connectionLock)
             {
                 if (generation != _connectionGeneration) throw new OperationCanceledException();
+                if (useSystemProxy) SetSystemProxy(true, "127.0.0.1", config.LocalPort);
                 _connectedState = "connecting";
             }
 
@@ -1278,7 +1263,10 @@ public class ApiService
         catch (Exception ex)
         {
             Debug.WriteLine($"Connection failed: {ex.Message}");
-            Volatile.Write(ref _lastError, ex.Message);
+            lock (_connectionLock)
+            {
+                if (generation == _connectionGeneration) Volatile.Write(ref _lastError, ex.Message);
+            }
             return null;
         }
         finally
@@ -1714,43 +1702,49 @@ public class ApiService
         }
     }
 
-    public async Task<GenericResponse?> DisconnectAsync()
+    public Task<GenericResponse?> DisconnectAsync() => DisconnectCoreAsync(DisconnectOwnedResourcesAsync);
+
+    internal static Task<GenericResponse?> DisconnectCoreAsync(Func<Task?, Process?, Task<GenericResponse?>> cleanup)
     {
-        Task? task;
-        Process? process;
+        Task? task = null;
+        Process? process = null;
+        TaskCompletionSource<GenericResponse?> owner;
+        Task<GenericResponse?> published;
         lock (_connectionLock)
         {
+            if (_disconnectTask != null) return _disconnectTask;
+            owner = new TaskCompletionSource<GenericResponse?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            published = _disconnectTask = owner.Task;
             ++_connectionGeneration;
             _connectionCts?.Cancel();
             _wireGuardMonitorCts?.Cancel();
             task = _connectionTask;
             process = _singBoxProcess;
             _singBoxProcess = null;
-            _connectedState = "disconnected";
+            _connectedState = "disconnecting";
             _connectionStartTime = null;
             _currentPublicIp = "--";
             _currentLatency = 0;
             _currentDownloadTotal = 0;
             _currentUploadTotal = 0;
-            // Manual disconnect must cancel any pending retry and clear stale errors.
+            // Manual disconnect cancels retries; completion records any cleanup error.
             _reconnectAttempt = 0;
             _reconnectDelay = 0;
             Volatile.Write(ref _lastError, string.Empty);
         }
+        _ = CompleteDisconnectAsync(owner, task, process, cleanup);
+        return published;
+    }
 
-        GenericResponse wireGuardResult;
-        await _nativeLifecycle.WaitAsync();
-        try { wireGuardResult = await StopWireGuardAsync(); }
-        finally { _nativeLifecycle.Release(); }
-        SetSystemProxy(false);
-        StopOwnedProcess(process, false);
-        StopBundledSingBoxProcesses();
-        if (task != null)
+    private static async Task CompleteDisconnectAsync(TaskCompletionSource<GenericResponse?> owner, Task? task,
+        Process? process, Func<Task?, Process?, Task<GenericResponse?>> cleanup)
+    {
+        GenericResponse result;
+        try
         {
-            try { await task; } catch (OperationCanceledException) {} catch (Exception ex) { Debug.WriteLine(ex.Message); }
+            result = await cleanup(task, process) ?? new GenericResponse { Message = "Không thể hoàn tất dọn dẹp kết nối." };
         }
-        try { process?.Dispose(); } catch {}
-        DeleteRuntimeSingBoxConfig();
+        catch (Exception ex) { result = new GenericResponse { Message = ex.Message }; }
         lock (_connectionLock)
         {
             if (ReferenceEquals(task, _connectionTask))
@@ -1759,11 +1753,47 @@ public class ApiService
                 _connectionCts?.Dispose();
                 _connectionCts = null;
             }
+            _connectedState = result.Success ? "disconnected" : "error";
+            Volatile.Write(ref _lastError, result.Success ? string.Empty :
+                string.IsNullOrWhiteSpace(result.Message) ? "Không thể hoàn tất dọn dẹp kết nối." : result.Message);
+            owner.TrySetResult(result);
+            _disconnectTask = null;
         }
+    }
 
-        return wireGuardResult.Success
-            ? new GenericResponse { Success = true, Message = "Đã ngắt kết nối." }
-            : wireGuardResult;
+    private async Task<GenericResponse?> DisconnectOwnedResourcesAsync(Task? task, Process? process)
+    {
+        // Drain every old owner before final cleanup. No old connect/recovery
+        // may set a proxy or start a native tunnel after this cleanup succeeds.
+        StopOwnedProcess(process, false);
+        Task? recovery;
+        lock (_connectionLock) { recovery = _wireGuardRecoveryTask; }
+        return await DrainThenCleanupAsync(task, recovery, async () =>
+        {
+            GenericResponse result;
+            try
+            {
+                await _nativeLifecycle.WaitAsync();
+                try { result = await StopWireGuardAsync(); }
+                finally { _nativeLifecycle.Release(); }
+            }
+            catch (Exception ex) { result = new GenericResponse { Message = ex.Message }; }
+            SetSystemProxy(false);
+            try { process?.Dispose(); } catch { }
+            DeleteRuntimeSingBoxConfig();
+            return result.Success ? new GenericResponse { Success = true, Message = "Đã ngắt kết nối." } : result;
+        });
+    }
+
+    internal static async Task<GenericResponse?> DrainThenCleanupAsync(Task? connection, Task? recovery,
+        Func<Task<GenericResponse?>> cleanup)
+    {
+        foreach (Task? owner in new[] { connection, recovery })
+        {
+            if (owner == null) continue;
+            try { await owner; } catch (Exception ex) { Debug.WriteLine(ex.Message); }
+        }
+        return await cleanup();
     }
 
     public async Task<GenericResponse> ConfigureWireGuardAsync(string nodeId, string configText)
@@ -1861,7 +1891,7 @@ public class ApiService
         lock (_connectionLock)
         {
             if (_wireGuardRecoveryTask != null && !_wireGuardRecoveryTask.IsCompleted) return;
-            if (_connectedState == "disconnected") return;
+            if (_disconnectTask != null || (_connectedState != "connected" && _connectedState != "reconnecting")) return;
             _connectedState = "reconnecting";
             int generation = ++_connectionGeneration;
             _wireGuardRecoveryTask = Task.Run(() => RecoverWireGuardAsync(generation));
@@ -1927,9 +1957,12 @@ public class ApiService
         catch (OperationCanceledException) { }
         finally
         {
-            if (ReferenceEquals(_wireGuardMonitorCts, monitorCts))
-                _wireGuardMonitorCts = null;
-            monitorCts.Dispose();
+            lock (_connectionLock)
+            {
+                if (ReferenceEquals(_wireGuardMonitorCts, monitorCts))
+                    _wireGuardMonitorCts = null;
+                monitorCts.Dispose();
+            }
         }
     }
 
@@ -2039,10 +2072,18 @@ public class ApiService
                         }
                         AppConfig config = LoadConfig();
                         Proxy? activeProxy = config.SavedProxies.FirstOrDefault(p => p.Id == config.ActiveProxyId);
-                        StartWireGuardMonitor(generation, AppPaths.WireGuardTunnelBaseName(GetWireGuardNodeId(activeProxy)));
+                        lock (_connectionLock)
+                        {
+                            if (generation == _connectionGeneration)
+                                StartWireGuardMonitor(generation, AppPaths.WireGuardTunnelBaseName(GetWireGuardNodeId(activeProxy)));
+                        }
                         return;
                     }
-                    Volatile.Write(ref _lastError, result.Message);
+                    lock (_connectionLock)
+                    {
+                        if (generation != _connectionGeneration) return;
+                        Volatile.Write(ref _lastError, result.Message);
+                    }
                 }
                 lock (_connectionLock)
                 {
@@ -2076,9 +2117,7 @@ public class ApiService
         VpnServiceReply serviceReply = await VpnServiceClient.SendCommandAsync("STOP_WIREGUARD");
         if (serviceReply.Available)
         {
-            return serviceReply.Success
-                ? new GenericResponse { Success = true, Message = "WireGuard đã ngắt kết nối qua 292VPN Service." }
-                : new GenericResponse { Success = false, Message = "292VPN Service không thể dừng WireGuard." };
+            return WireGuardStopResponse(serviceReply);
         }
 
         string executable = GetWireGuardExecutablePath();
@@ -3310,6 +3349,7 @@ public class ApiService
             }
             else if (scheme == "hysteria2" || scheme == "hy2")
             {
+                if (uri.Port == 0) throw new FormatException("Cổng Hysteria phải nằm trong khoảng 1-65535.");
                 result["type"] = "hysteria2";
                 result["password"] = Uri.UnescapeDataString(uri.UserInfo);
 
@@ -3347,14 +3387,95 @@ public class ApiService
                 {
                     result["down_mbps"] = downMbps;
                 }
+
+                // UDP Port Hopping (mport / ports: e.g. "20000-50000" or "20000:50000")
+                string mport = queryParams.ContainsKey("mport") ? queryParams["mport"]
+                    : queryParams.ContainsKey("ports") ? queryParams["ports"] : "";
+                if (queryParams.ContainsKey("mport") && queryParams.ContainsKey("ports") && queryParams["mport"] != queryParams["ports"])
+                    throw new FormatException("Không thể dùng mport và ports khác nhau.");
+                bool hasPorts = queryParams.ContainsKey("mport") || queryParams.ContainsKey("ports");
+                if (hasPorts)
+                {
+                    string[] serverPorts = ParseHysteriaServerPorts(mport);
+                    result["server_ports"] = serverPorts;
+                    result.Remove("server_port");
+                    string hopInterval = queryParams.ContainsKey("hop_interval")
+                        ? queryParams["hop_interval"].Trim()
+                        : "30s";
+                    ValidateHopInterval(hopInterval);
+                    result["hop_interval"] = hopInterval;
+                }
+                else if (queryParams.ContainsKey("hop_interval"))
+                    throw new FormatException("hop_interval yêu cầu mport hoặc ports.");
+                else if (uri.Port < 1)
+                    result["server_port"] = 443;
             }
 
             return result;
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException("Không thể phân tích cấu hình proxy URL.", ex);
+            throw new InvalidOperationException("Không thể phân tích cấu hình proxy URL: " + ex.Message, ex);
         }
+    }
+
+    internal static GenericResponse WireGuardStopResponse(VpnServiceReply reply) => reply.Success
+        ? new GenericResponse { Success = true, Message = "WireGuard đã ngắt kết nối qua 292VPN Service." }
+        : new GenericResponse { Success = false, Message = "292VPN Service không thể dừng WireGuard" + FormatServiceError(reply) + "." };
+
+    internal static string[] ParseHysteriaServerPorts(string value)
+    {
+        string[] entries = value.Split(',')
+            .Select(item => item.Trim()).ToArray();
+        if (entries.Length == 0 || entries.Any(item => item.Length == 0))
+            throw new FormatException("Danh sách cổng Hysteria không hợp lệ.");
+
+        var ports = new List<string>();
+        foreach (string entry in entries)
+        {
+            string normalized = entry.Replace('-', ':');
+            if (!Regex.IsMatch(normalized, @"^[0-9]+(:[0-9]+)?$", RegexOptions.CultureInvariant))
+                throw new FormatException("Danh sách cổng Hysteria không hợp lệ.");
+            string[] bounds = normalized.Split(':');
+            if (bounds.Length == 1)
+            {
+                if (!int.TryParse(bounds[0], out int port) || port < 1 || port > 65535)
+                    throw new FormatException("Cổng Hysteria phải nằm trong khoảng 1-65535.");
+                // sing-box's server_ports accepts ranges, including singleton ranges.
+                ports.Add(port + ":" + port);
+                continue;
+            }
+            if (bounds.Length != 2 || !int.TryParse(bounds[0], out int first) || !int.TryParse(bounds[1], out int last)
+                || first < 1 || last > 65535 || first > last)
+                throw new FormatException("Khoảng cổng Hysteria không hợp lệ.");
+            ports.Add(first + ":" + last);
+        }
+        return ports.ToArray();
+    }
+
+    internal static void ValidateHopInterval(string value)
+    {
+        // Go duration syntax used by sing-box (positive, within signed int64 ns).
+        var parts = Regex.Matches(value, @"([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(ns|us|µs|μs|ms|s|m|h)");
+        int length = 0;
+        decimal nanoseconds = 0;
+        foreach (Match part in parts)
+        {
+            if (part.Index != length) throw new FormatException("hop_interval không hợp lệ.");
+            length += part.Length;
+            if (!decimal.TryParse(part.Groups[1].Value, System.Globalization.NumberStyles.AllowDecimalPoint,
+                System.Globalization.CultureInfo.InvariantCulture, out decimal number))
+                throw new FormatException("hop_interval quá lớn.");
+            decimal scale = part.Groups[2].Value switch
+            {
+                "h" => 3600000000000m, "m" => 60000000000m, "s" => 1000000000m,
+                "ms" => 1000000m, "us" or "µs" or "μs" => 1000m, _ => 1m
+            };
+            if (number > long.MaxValue / scale) throw new FormatException("hop_interval quá lớn.");
+            nanoseconds += decimal.Truncate(number * scale);
+        }
+        if (length != value.Length || nanoseconds < 1 || nanoseconds > long.MaxValue)
+            throw new FormatException("hop_interval phải là khoảng thời gian dương, ví dụ 30s hoặc 1m30s.");
     }
 
     private string DecodeBase64(string b64)
@@ -3377,6 +3498,7 @@ public class ApiService
     {
         string proxyType = activeProxy.Type.ToUpper();
         object outboundProxy;
+        object? outboundVoip = null;
         object? wireGuardEndpoint = null;
 
         if (proxyType == "WIREGUARD")
@@ -3392,6 +3514,12 @@ public class ApiService
                 dictProxy["tag"] = "proxy-out";
             }
             outboundProxy = parsed;
+            var parsedVoip = ParseProxyUrlToOutbound(activeProxy.Ip);
+            if (parsedVoip is Dictionary<string, object> dictVoip)
+            {
+                dictVoip["tag"] = "voip-out";
+                outboundVoip = dictVoip;
+            }
         }
         else
         {
@@ -3420,6 +3548,7 @@ public class ApiService
             outboundProxy = socksProxy;
         }
 
+        string voipOutboundTag = outboundVoip != null ? "voip-out" : "proxy-out";
         var outboundDirect = new { type = "direct", tag = "direct-out" };
 
         // sing-box 1.13 removed the special "dns"/"block" outbounds; DNS is
@@ -3434,10 +3563,12 @@ public class ApiService
         {
             outboundsList.Add(outboundDirect);
             outboundsList.Add(outboundProxy);
+            if (outboundVoip != null) outboundsList.Add(outboundVoip);
         }
         else
         {
             outboundsList.Add(outboundProxy);
+            if (outboundVoip != null) outboundsList.Add(outboundVoip);
             outboundsList.Add(outboundDirect);
         }
 
@@ -3480,10 +3611,10 @@ public class ApiService
         {
             new { action = "sniff" },
             new { protocol = "dns", action = "hijack-dns" },
-            // VoiceProbe measures the call path, so it must take the tunnel even
+            // VoiceProbe measures the call path, so it must take the VoIP tunnel even
             // to the node's own IP or its private WireGuard address.
-            new { process_name = new[] { VoiceProbeProcessName }, outbound = "proxy-out" },
-            new { process_path_regex = ProcessNameRegexes(new[] { VoiceProbeProcessName }), outbound = "proxy-out" },
+            new { process_name = new[] { VoiceProbeProcessName }, outbound = voipOutboundTag },
+            new { process_path_regex = ProcessNameRegexes(new[] { VoiceProbeProcessName }), outbound = voipOutboundTag },
             new { ip_is_private = true, outbound = "direct-out" }
         };
         if (wireGuardEndpoint != null)
@@ -3550,6 +3681,23 @@ public class ApiService
         var selectedProcessRules = new List<string>();
         var selectedProcessNames = new List<string>();
         bool whatsappSelected = false;
+
+        // Isolate SIP signaling and softphone RTP audio on a dedicated VoIP
+        // outbound BEFORE generic process rules so background apps (ZManager/Zalo)
+        // and health probes cannot contend with the real-time audio QUIC/UDP session.
+        if (config.ProxyMode == "selected_only" || (config.ProxyMode == "all" && outboundVoip != null))
+        {
+            var voipNames = VoipProcessFamily.Distinct(StringComparer.Ordinal).ToList();
+            routeRules.Add(new { network = new[] { "tcp", "udp" }, port = new[] { 5060, 5061 }, outbound = voipOutboundTag });
+            routeRules.Add(new { process_name = voipNames, outbound = voipOutboundTag });
+            routeRules.Add(new { process_path_regex = ProcessNameRegexes(voipNames), outbound = voipOutboundTag });
+            if (config.ProxyMode == "selected_only")
+            {
+                selectedProcessNames.AddRange(voipNames);
+                selectedProcessRules.AddRange(ProcessNameRegexes(voipNames));
+            }
+        }
+
         if (processOutbound != null && config.AllowedProcesses.Count > 0)
         {
             var procPaths = config.AllowedProcesses
@@ -3569,20 +3717,23 @@ public class ApiService
                 .ToList();
             procPaths.AddRange(FindRunningProcessPaths(procNames));
             procPaths = procPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            selectedProcessNames.AddRange(procNames);
-            selectedProcessNames.AddRange(
+            var matchedProcessNames = new List<string>(procNames);
+            matchedProcessNames.AddRange(
                 procPaths.Select(Path.GetFileName).Where(p => !string.IsNullOrEmpty(p))!);
-            if (procPaths.Concat(procNames).Any(p =>
-                ManagedZaloProcessFamily.Contains(Path.GetFileName(p), StringComparer.OrdinalIgnoreCase)))
+            // Substring match: users type "zalo" or pick Zalo.exe, and the call
+            // plugin (ZaloCall.exe) must be recognised as Zalo as well.
+            bool zaloSelected = procPaths.Concat(procNames).Any(p =>
+                p.IndexOf("zalo", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (zaloSelected)
             {
                 procNames.AddRange(ManagedZaloProcessFamily);
-                selectedProcessNames.AddRange(ManagedZaloProcessFamily);
+                matchedProcessNames.AddRange(ManagedZaloProcessFamily);
             }
             if (procPaths.Concat(procNames).Any(p =>
                 UltraViewerProcessFamily.Contains(Path.GetFileName(p), StringComparer.OrdinalIgnoreCase)))
             {
                 procNames.AddRange(UltraViewerProcessFamily);
-                selectedProcessNames.AddRange(UltraViewerProcessFamily);
+                matchedProcessNames.AddRange(UltraViewerProcessFamily);
             }
             // Substring match rather than family membership: users type
             // "whatsapp" or "WhatsApp", neither of which equals a real
@@ -3594,9 +3745,52 @@ public class ApiService
             {
                 whatsappSelected = true;
                 procNames.AddRange(WhatsAppProcessFamily);
-                selectedProcessNames.AddRange(WhatsAppProcessFamily);
+                matchedProcessNames.AddRange(WhatsAppProcessFamily);
             }
+            matchedProcessNames = matchedProcessNames.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            selectedProcessNames.AddRange(matchedProcessNames);
             selectedProcessNames = selectedProcessNames.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            if (zaloSelected && config.ProxyMode == "selected_only")
+            {
+                static bool IsZaloApp(string p)
+                {
+                    string name = Path.GetFileName(p);
+                    return ManagedZaloProcessFamily.Contains(name, StringComparer.OrdinalIgnoreCase)
+                        || ManagedZaloProcessFamily.Contains(Path.GetFileNameWithoutExtension(name) + ".exe", StringComparer.OrdinalIgnoreCase);
+                }
+
+                // Zalo's chat app and launchers must not be caught by the generic
+                // proxy-out rules below: their TCP has to keep using the
+                // per-profile Vietnam proxy, so they are matched only by the
+                // call rules added here, which run first (sing-box uses the first
+                // matching rule).
+                var zaloPaths = procPaths.Where(IsZaloApp).ToList();
+                procPaths.RemoveAll(IsZaloApp);
+                procNames.RemoveAll(IsZaloApp);
+                matchedProcessNames.RemoveAll(IsZaloApp);
+
+                routeRules.Add(new { process_name = ZaloCallProcessFamily, outbound = "proxy-out" });
+                routeRules.Add(new { process_path_regex = ProcessNameRegexes(ZaloCallProcessFamily), outbound = "proxy-out" });
+                // Helpers inside the Zalo installation tree own media sockets in
+                // some builds and can appear after the tunnel started, so their
+                // UDP goes to the tunnel while their TCP stays direct.
+                var zaloDirectories = ProcessDirectoryRegexes(zaloPaths);
+                if (zaloDirectories.Count > 0)
+                {
+                    routeRules.Add(new { network = new[] { "udp" }, process_path_regex = zaloDirectories, outbound = "proxy-out" });
+                }
+
+                // Still resolve Zalo lookups through the tunnel so relay/media
+                // names are not answered by a filtered local resolver.
+                selectedProcessNames.AddRange(ManagedZaloProcessFamily);
+                selectedProcessNames.AddRange(ZaloCallProcessFamily);
+                selectedProcessNames = selectedProcessNames.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                selectedProcessRules.AddRange(ProcessNameRegexes(ManagedZaloProcessFamily));
+                selectedProcessRules.AddRange(ProcessNameRegexes(ZaloCallProcessFamily));
+                selectedProcessRules.AddRange(zaloDirectories);
+            }
+
             procNames = ProcessNameRegexes(procNames);
             var procDirectories = ProcessDirectoryRegexes(procPaths);
             if (procPaths.Count > 0)
@@ -3610,9 +3804,9 @@ public class ApiService
                 // helpers created after the VPN connection has started.
                 routeRules.Add(new { process_path_regex = procDirectories, outbound = processOutbound });
             }
-            if (selectedProcessNames.Count > 0)
+            if (matchedProcessNames.Count > 0)
             {
-                routeRules.Add(new { process_name = selectedProcessNames, outbound = processOutbound });
+                routeRules.Add(new { process_name = matchedProcessNames, outbound = processOutbound });
             }
             if (procNames.Count > 0)
             {
@@ -3625,36 +3819,17 @@ public class ApiService
             selectedProcessRules = selectedProcessRules.Distinct(StringComparer.Ordinal).ToList();
         }
 
-        if (config.ProxyMode == "selected_only")
-        {
-            // SIP can emit its first UDP packet before Windows reports the owning
-            // process. Route standard SIP signaling ports explicitly so the
-            // registration request cannot fall through to direct-out.
-            routeRules.Add(new { network = new[] { "tcp", "udp" }, port = new[] { 5060, 5061 }, outbound = "proxy-out" });
-            var voipNames = VoipProcessFamily.Distinct(StringComparer.Ordinal).ToList();
-            routeRules.Add(new { process_name = voipNames, outbound = "proxy-out" });
-            routeRules.Add(new { process_path_regex = ProcessNameRegexes(voipNames), outbound = "proxy-out" });
-            selectedProcessNames.AddRange(voipNames);
-            selectedProcessRules.AddRange(ProcessNameRegexes(voipNames));
-        }
-
         // Zalo is often launched by profile managers (ZaX, ZPool) that set a
         // per-profile Vietnam HTTP proxy. That proxy carries only TCP, so call
-        // audio leaves as direct UDP, which UAE blocks, and Zalo falls back to a
+        // media leaves as direct UDP, which UAE blocks, and Zalo falls back to a
         // choppy TCP relay. Tunnel only Zalo's UDP; its TCP keeps using the
-        // profile proxy without being nested inside the VPN.
+        // profile proxy without being nested inside the VPN. ZaloCall.exe rules
+        // above already cover the normal case; this keeps older builds, whose
+        // media sockets are opened by the chat app, working too.
         if (config.ProxyMode == "selected_only")
         {
             routeRules.Add(new { process_name = ManagedZaloProcessFamily, network = new[] { "udp" }, outbound = "proxy-out" });
             routeRules.Add(new { process_path_regex = ProcessNameRegexes(ManagedZaloProcessFamily), network = new[] { "udp" }, outbound = "proxy-out" });
-        }
-
-        // A webview's NetworkService is sometimes reported without the parent
-        // Zalo process. Domain matching prevents those connections from falling
-        // through to direct-out in selected-only mode.
-        if (config.ProxyMode == "selected_only")
-        {
-            routeRules.Add(new { domain_suffix = ZaloDomainSuffixes, outbound = "proxy-out" });
         }
 
         // Same fallback for WhatsApp's shared WebView2 process.

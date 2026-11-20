@@ -10,7 +10,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <LangVersion>10.0</LangVersion>
     <!-- Keep a three-part version so update comparisons remain deterministic. -->
-    <Version>1.5.7</Version>
+    <Version>1.5.9</Version>
     <AssemblyTitle>292VPN</AssemblyTitle>
     <Product>292VPN</Product>
     <Company>292VPN Team</Company>
